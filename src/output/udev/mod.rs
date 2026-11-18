@@ -48,6 +48,18 @@ pub struct UdevDeviceEntry {
     pub device: Device,
 }
 
+/// USB bus type advertised by every virtual device (`BUS_USB`).
+const VIRTUAL_BUS: u16 = 0x03;
+/// Vendor ID shared by Backflow's virtual devices (pid.codes).
+const VIRTUAL_VENDOR: u16 = 0x1209;
+/// Product IDs. They must stay distinct from each other and from every other
+/// uinput device on the host: Wine derives the HID device instance path from
+/// `VID_xxxx&PID_xxxx`, so two devices that share `0000:0000` collapse onto one
+/// registry node and only one of them is ever enumerated.
+const KEYBOARD_PRODUCT: u16 = 0xA1C1;
+const MOUSE_PRODUCT: u16 = 0xA1C2;
+const GAMEPAD_PRODUCT: u16 = 0xA1C3;
+
 /// Backend for managing udev virtual devices
 pub struct UdevOutputBackend {
     pub devices: HashMap<String, UdevDeviceEntry>,
@@ -98,6 +110,10 @@ impl UdevOutputBackend {
         let device = uinput::default()?
             .name("Backflow Virtual Keyboard")?
             .event(uinput::event::Keyboard::All)?
+            .bus(VIRTUAL_BUS)
+            .vendor(VIRTUAL_VENDOR)
+            .product(KEYBOARD_PRODUCT)
+            .version(1)
             .create()?;
 
         tracing::info!("Virtual keyboard device created successfully");
@@ -120,7 +136,9 @@ impl UdevOutputBackend {
             .event(uinput::event::Relative::Wheel(
                 uinput::event::relative::Wheel::Horizontal,
             ))?
-            .bus(0x03)
+            .bus(VIRTUAL_BUS)
+            .vendor(VIRTUAL_VENDOR)
+            .product(MOUSE_PRODUCT)
             .version(1);
 
         // Add mouse button events
@@ -152,6 +170,10 @@ impl UdevOutputBackend {
             ))?
             .min(-32768)
             .max(32767)
+            .bus(VIRTUAL_BUS)
+            .vendor(VIRTUAL_VENDOR)
+            .product(GAMEPAD_PRODUCT)
+            .version(1)
             .create()?;
 
         tracing::info!("Virtual gamepad device created successfully");
@@ -479,5 +501,25 @@ mod tests {
         assert!(UdevOutput::button_to_mouse_button(6).is_none());
         assert!(UdevOutput::button_to_gamepad_button(0).is_some());
         assert!(UdevOutput::button_to_gamepad_button(10).is_none());
+    }
+
+    #[test]
+    fn test_virtual_device_ids_are_distinct() {
+        // A zeroed VID/PID makes Wine collapse every virtual device onto the
+        // same `HID\VID_0000&PID_0000` node, so the keyboard is never
+        // enumerated as its own HID interface.
+        assert_ne!(VIRTUAL_VENDOR, 0);
+        assert_ne!(KEYBOARD_PRODUCT, 0);
+        assert_ne!(MOUSE_PRODUCT, 0);
+        assert_ne!(GAMEPAD_PRODUCT, 0);
+
+        let products = [KEYBOARD_PRODUCT, MOUSE_PRODUCT, GAMEPAD_PRODUCT];
+        for (i, a) in products.iter().enumerate() {
+            for b in &products[i + 1..] {
+                assert_ne!(a, b, "virtual devices must not share a product ID");
+            }
+        }
+
+        assert_eq!(VIRTUAL_BUS, 0x03, "virtual devices must claim USB");
     }
 }
