@@ -13,15 +13,30 @@
 //! This backend will be removed once the dedicated plugin is complete.
 
 use crate::feedback::{FeedbackEvent, FeedbackEventPacket, LedEvent};
-use crate::input::io_server::IoInboundMessage;
+use crate::input::io_server::{
+    ClientNode, ClientSettings, IoClientMessage, IoEventServer, IoInboundMessage,
+};
 use crate::input::{InputBackend, InputEvent, InputEventPacket, KeyboardEvent};
 use crate::output::rgb_to_brg;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+
+/// Feedback device id the CHUNITHM RGB service tags slider LED frames with.
+const LED_SLIDER_DEVICE_ID: &str = "chuni_jvs_board_2";
+/// How long the touch pattern keeps ownership after the last game LED frame.
+const LED_FEEDBACK_TIMEOUT_MS: u64 = 500;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 mod idevice_proxy;
 use idevice_proxy::spawn_iproxy;
@@ -48,10 +63,18 @@ impl BoardInputState {
     }
 }
 
-type ClientCleanup = (
-    Arc<RwLock<Vec<Arc<tokio::sync::Mutex<tokio::net::TcpStream>>>>>,
-    Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
-);
+/// Write half of a connected client. Reads and writes must not share a lock: the
+/// read loop holds its half across `await`, so a shared mutex would block the LED
+/// broadcast for as long as the client is idle.
+type ClientWriter = Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>;
+
+type ClientList = Arc<RwLock<Vec<ClientWriter>>>;
+
+fn new_client_list() -> ClientList {
+    Arc::new(RwLock::new(Vec::new()))
+}
+
+type ClientCleanup = (ClientList, ClientWriter);
 
 /// Global shared state for Brokenithm input
 static BROKENITHM_SHARED_STATE: OnceLock<RwLock<Option<BoardInputState>>> = OnceLock::new();
@@ -100,6 +123,8 @@ pub struct BrokenithmTcpBackend {
     pub config: BrokenithmTcpConfig,
     /// Inbound sender into unified IoEventServer (produces IoInboundMessage::Input)
     pub inbound_tx: tokio::sync::mpsc::UnboundedSender<IoInboundMessage>,
+    /// Optional hub used to subscribe to LED feedback for the connected client
+    pub io_server: Option<Arc<IoEventServer>>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,7 +146,17 @@ impl BrokenithmTcpBackend {
         config: BrokenithmTcpConfig,
         inbound_tx: tokio::sync::mpsc::UnboundedSender<IoInboundMessage>,
     ) -> Self {
-        Self { config, inbound_tx }
+        Self {
+            config,
+            inbound_tx,
+            io_server: None,
+        }
+    }
+
+    /// Attach the unified IoEventServer so LED feedback can be forwarded to the client.
+    pub fn with_io_server(mut self, io_server: Arc<IoEventServer>) -> Self {
+        self.io_server = Some(io_server);
+        self
     }
 
     pub fn server(
@@ -155,8 +190,29 @@ impl BrokenithmTcpBackend {
     }
 }
 
+/// Build the 100-byte `cLED` frame the iOS client expects.
+///
+/// The client copies the 96 payload bytes, reverses them, and reads lane `i` as
+/// `ledArray[6i..6i+6]` = main slot `[g, r, b]` then split slot `[g, r, b]`.
+/// So slots are laid out in client order here and the payload is reversed on the
+/// way out, which keeps the wire format byte-identical to the old broadcast.
+fn cled_frame(slots: &[[u8; 3]; 32]) -> Vec<u8> {
+    let mut led_msg = Vec::with_capacity(4 + 32 * 3);
+    led_msg.extend_from_slice(&[99, 76, 69, 68]); // "cLED"
+    for rgb in slots.iter().rev() {
+        led_msg.extend_from_slice(&rgb_to_brg(rgb));
+    }
+    led_msg
+}
+
+/// Convert slider LED feedback into a `cLED` frame.
+///
+/// The RGB service either emits one event per clamped zone (16 by default) or one
+/// per raw LED (31). A zone lights both its main and its split slot, so a 16-zone
+/// frame fills all 16 lanes instead of only the first eight.
 fn led_feedback_to_cled(feedback: &FeedbackEventPacket) -> Vec<u8> {
-    let mut leds = [[0u8, 0u8, 0u8]; 32];
+    let mut zones = [[0u8, 0u8, 0u8]; 32];
+    let mut count = 0usize;
     for event in &feedback.events {
         if let FeedbackEvent::Led(LedEvent::Set {
             led_id,
@@ -165,33 +221,41 @@ fn led_feedback_to_cled(feedback: &FeedbackEventPacket) -> Vec<u8> {
         }) = event
         {
             if (*led_id as usize) < 32 {
-                leds[*led_id as usize] = [*r, *g, *b];
+                zones[*led_id as usize] = [*r, *g, *b];
+                count = count.max(*led_id as usize + 1);
             }
         }
     }
-    let mut led_msg = Vec::with_capacity(4 + 32 * 3);
-    led_msg.extend_from_slice(&[99, 76, 69, 68]); // "cLED"
-    for rgb in leds.iter() {
-        led_msg.extend_from_slice(&rgb_to_brg(rgb));
+
+    let mut slots = [[0u8, 0u8, 0u8]; 32];
+    if count <= 16 {
+        // One colour per lane: duplicate it into the main and split slot.
+        for lane in 0..16 {
+            let rgb = zones[lane];
+            slots[lane * 2] = rgb;
+            slots[lane * 2 + 1] = rgb;
+        }
+    } else {
+        slots.copy_from_slice(&zones);
     }
-    led_msg
+
+    cled_frame(&slots)
 }
 
 /// LED pattern: set only active slider zones to white, others off
 fn led_slider_active_pattern(slider: &[u8]) -> Vec<u8> {
-    let mut led_msg = Vec::with_capacity(4 + 32 * 3);
-    led_msg.extend_from_slice(&[99, 76, 69, 68]); // "cLED"
-    for i in 0..32 {
-        // Offset index by 1, wrapping around to align LEDs with slider zones
-        let idx = (i + 1) % 32;
-        let val = slider.get(idx).copied().unwrap_or(0);
-        if val >= 128 {
-            led_msg.extend_from_slice(&rgb_to_brg(&[255, 255, 255])); // White for active
-        } else {
-            led_msg.extend_from_slice(&rgb_to_brg(&[0, 0, 0])); // Off for inactive
+    let mut slots = [[0u8, 0u8, 0u8]; 32];
+    for lane in 0..16 {
+        let main = slider.get(lane * 2).copied().unwrap_or(0) >= 128;
+        let split = slider.get(lane * 2 + 1).copied().unwrap_or(0) >= 128;
+        if main {
+            slots[lane * 2] = [255, 255, 255];
+        }
+        if split {
+            slots[lane * 2 + 1] = [255, 255, 255];
         }
     }
-    led_msg
+    cled_frame(&slots)
 }
 
 #[async_trait::async_trait]
@@ -215,35 +279,102 @@ impl InputBackend for BrokenithmTcpBackend {
     }
 }
 
+/// Drop a client from the broadcast list, matching by pointer rather than index so
+/// the broadcast task and a closing connection cannot remove each other's entry.
+async fn remove_client(clients: &ClientList, target: &ClientWriter) {
+    let mut guard = clients.write().await;
+    if let Some(pos) = guard.iter().position(|c| Arc::ptr_eq(c, target)) {
+        guard.remove(pos);
+    }
+}
+
 impl BrokenithmTcpBackend {
+    /// Subscribe to slider LED feedback and mirror it to every connected client.
+    fn spawn_led_broadcast(&self, clients: ClientList, last_feedback_ms: Arc<AtomicU64>) {
+        let Some(io_server) = self.io_server.clone() else {
+            tracing::debug!("No IoEventServer attached; Brokenithm LED feedback disabled");
+            return;
+        };
+
+        // The TCP and iDevice backends both run at once, and IoEventServer keys
+        // clients by id, so each subscription needs its own.
+        static NEXT_SUBSCRIBER: AtomicU64 = AtomicU64::new(0);
+        let subscriber_id = format!(
+            "brokenithm_led_{}",
+            NEXT_SUBSCRIBER.fetch_add(1, Ordering::Relaxed)
+        );
+
+        tokio::spawn(async move {
+            let mut rx = io_server
+                .register_client(ClientNode {
+                    id: subscriber_id,
+                    client_settings: ClientSettings {
+                        feedback_listener_device_ids: vec![LED_SLIDER_DEVICE_ID.to_string()],
+                        ..Default::default()
+                    },
+                })
+                .await;
+            tracing::info!("Brokenithm LED feedback subscribed to {LED_SLIDER_DEVICE_ID}");
+
+            while let Some(msg) = rx.recv().await {
+                let IoClientMessage::Feedback(packet) = msg else {
+                    continue;
+                };
+                let led_msg = led_feedback_to_cled(&packet);
+                last_feedback_ms.store(now_ms(), Ordering::Relaxed);
+
+                let dead: Vec<ClientWriter> = {
+                    let guard = clients.read().await;
+                    let mut dead = Vec::new();
+                    for client in guard.iter() {
+                        let mut sock = client.lock().await;
+                        if let Err(e) = sock.write_all(&led_msg).await {
+                            tracing::warn!("Failed to send LED frame to Brokenithm client: {e}");
+                            dead.push(client.clone());
+                        }
+                    }
+                    dead
+                };
+                for client in dead {
+                    remove_client(&clients, &client).await;
+                }
+            }
+
+            tracing::info!("Brokenithm LED feedback channel closed");
+        });
+    }
+
     async fn run_server(&mut self, bind_addr: SocketAddr) -> eyre::Result<()> {
         let listener = TcpListener::bind(bind_addr).await?;
         tracing::info!("Brokenithm TCP backend listening on {}", bind_addr);
 
-        // Legacy feedback broadcast removed
-        let clients: Arc<RwLock<Vec<Arc<tokio::sync::Mutex<tokio::net::TcpStream>>>>> =
-            Arc::new(RwLock::new(Vec::new()));
+        let clients = new_client_list();
+        let last_feedback_ms = Arc::new(AtomicU64::new(0));
+        self.spawn_led_broadcast(clients.clone(), last_feedback_ms.clone());
 
         loop {
             let (socket, addr) = listener.accept().await?;
             tracing::info!("Accepted TCP connection from {}", addr);
-            let client_mutex = Arc::new(tokio::sync::Mutex::new(socket));
+            let (read_half, write_half) = socket.into_split();
+            let writer: ClientWriter = Arc::new(tokio::sync::Mutex::new(write_half));
 
             // Register this client for feedback
             {
                 let mut clients_guard = clients.write().await;
-                clients_guard.push(client_mutex.clone());
+                clients_guard.push(writer.clone());
             }
 
             let clients_for_removal = clients.clone();
-            let client_mutex_for_removal = client_mutex.clone();
             let inbound_tx = self.inbound_tx.clone();
+            let last_feedback_ms = last_feedback_ms.clone();
             tokio::spawn(async move {
                 Self::handle_connection(
-                    client_mutex,
-                    Some((clients_for_removal, client_mutex_for_removal)),
+                    read_half,
+                    writer,
+                    Some(clients_for_removal),
                     Some(addr),
                     inbound_tx,
+                    last_feedback_ms,
                 )
                 .await;
             });
@@ -251,13 +382,27 @@ impl BrokenithmTcpBackend {
     }
 
     async fn run_client(&mut self, connect_addr: SocketAddr) -> eyre::Result<()> {
+        let clients = new_client_list();
+        let last_feedback_ms = Arc::new(AtomicU64::new(0));
+        self.spawn_led_broadcast(clients.clone(), last_feedback_ms.clone());
+
         loop {
             match TcpStream::connect(connect_addr).await {
                 Ok(socket) => {
                     tracing::info!("Connected to Brokenithm device at {}", connect_addr);
-                    let socket = Arc::new(tokio::sync::Mutex::new(socket));
+                    let (read_half, write_half) = socket.into_split();
+                    let writer: ClientWriter = Arc::new(tokio::sync::Mutex::new(write_half));
+                    clients.write().await.push(writer.clone());
                     let inbound_tx = self.inbound_tx.clone();
-                    Self::handle_connection(socket, None, None, inbound_tx).await;
+                    Self::handle_connection(
+                        read_half,
+                        writer,
+                        Some(clients.clone()),
+                        None,
+                        inbound_tx,
+                        last_feedback_ms.clone(),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -285,6 +430,10 @@ impl BrokenithmTcpBackend {
             local_port
         );
 
+        let clients = new_client_list();
+        let last_feedback_ms = Arc::new(AtomicU64::new(0));
+        self.spawn_led_broadcast(clients.clone(), last_feedback_ms.clone());
+
         // Connect to the local forwarded port
         let connect_addr = format!("127.0.0.1:{local_port}");
         loop {
@@ -294,9 +443,19 @@ impl BrokenithmTcpBackend {
                         "Connected to Brokenithm device via iproxy at {}",
                         connect_addr
                     );
-                    let socket = Arc::new(tokio::sync::Mutex::new(socket));
+                    let (read_half, write_half) = socket.into_split();
+                    let writer: ClientWriter = Arc::new(tokio::sync::Mutex::new(write_half));
+                    clients.write().await.push(writer.clone());
                     let inbound_tx = self.inbound_tx.clone();
-                    Self::handle_connection(socket, None, None, inbound_tx).await;
+                    Self::handle_connection(
+                        read_half,
+                        writer,
+                        Some(clients.clone()),
+                        None,
+                        inbound_tx,
+                        last_feedback_ms.clone(),
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::error!(
@@ -311,18 +470,19 @@ impl BrokenithmTcpBackend {
     }
 
     async fn handle_connection(
-        socket: Arc<tokio::sync::Mutex<TcpStream>>,
-        client_cleanup: Option<ClientCleanup>,
+        mut read_half: tokio::net::tcp::OwnedReadHalf,
+        writer: ClientWriter,
+        client_list: Option<ClientList>,
         addr: Option<SocketAddr>,
         inbound_tx: tokio::sync::mpsc::UnboundedSender<IoInboundMessage>,
+        last_feedback_ms: Arc<AtomicU64>,
     ) {
         let mut buffer = Vec::new();
         let mut read_buf = [0u8; 256];
         let mut state_tracker = BrokenithmInputStateTracker::new();
 
         loop {
-            let mut socket_guard = socket.lock().await;
-            match socket_guard.read(&mut read_buf).await {
+            match read_half.read(&mut read_buf).await {
                 Ok(0) => {
                     if let Some(addr) = addr {
                         tracing::info!("Connection closed by {}", addr);
@@ -330,22 +490,12 @@ impl BrokenithmTcpBackend {
                         tracing::info!("Connection closed by remote");
                     }
 
-                    // Remove this client from the shared list if it's a server connection
-                    if let Some((clients_for_removal, client_mutex_for_removal)) = client_cleanup {
-                        let mut clients_guard = clients_for_removal.write().await;
-                        if let Some(pos) = clients_guard
-                            .iter()
-                            .position(|c| Arc::ptr_eq(c, &client_mutex_for_removal))
-                        {
-                            clients_guard.remove(pos);
-                        }
+                    if let Some(clients) = client_list {
+                        remove_client(&clients, &writer).await;
                     }
                     break;
                 }
                 Ok(len) => {
-                    // Release lock before processing
-                    drop(socket_guard);
-
                     // Append new data to buffer
                     buffer.extend_from_slice(&read_buf[..len]);
 
@@ -363,31 +513,30 @@ impl BrokenithmTcpBackend {
                                 test_button,
                                 service_button,
                             } => {
-                                if let Some(_packet) = state_tracker.diff_and_packet(
+                                if let Some(packet) = state_tracker.diff_and_packet(
                                     &air,
                                     &slider,
                                     test_button,
                                     service_button,
                                 ) {
-                                    // Emit into unified IoEventServer
-                                    if let Some(packet) = state_tracker.diff_and_packet(
-                                        &air,
-                                        &slider,
-                                        test_button,
-                                        service_button,
-                                    ) {
-                                        let _ = inbound_tx.send(IoInboundMessage::Input {
-                                            client_id: "brokenithm".to_string(),
-                                            packet,
-                                        });
-                                    }
+                                    let _ = inbound_tx.send(IoInboundMessage::Input {
+                                        client_id: "brokenithm".to_string(),
+                                        packet,
+                                    });
                                 }
                                 // Always update shared state regardless of event emission
                                 state_tracker.update_shared_state(test_button, service_button);
-                                // Send LED pattern for active sliders using raw values
-                                let led_msg = led_slider_active_pattern(&slider);
-                                let mut socket_guard = socket.lock().await;
-                                let _ = socket_guard.write_all(&led_msg).await;
+                                // Fall back to the touch pattern only while the game is not
+                                // sending LED frames; otherwise the broadcast task owns the LEDs.
+                                if last_feedback_ms.load(Ordering::Relaxed) == 0
+                                    || now_ms()
+                                        .saturating_sub(last_feedback_ms.load(Ordering::Relaxed))
+                                        > LED_FEEDBACK_TIMEOUT_MS
+                                {
+                                    let led_msg = led_slider_active_pattern(&slider);
+                                    let mut sock = writer.lock().await;
+                                    let _ = sock.write_all(&led_msg).await;
+                                }
                             }
                             BrokenithmMessage::InsertCoin => {
                                 state_tracker.pulse_coin();
@@ -395,23 +544,16 @@ impl BrokenithmTcpBackend {
                                 let slider = state_tracker.prev_slider.clone();
                                 let test_button = state_tracker.prev_test;
                                 let service_button = state_tracker.prev_service;
-                                if let Some(_packet) = state_tracker.diff_and_packet(
+                                if let Some(packet) = state_tracker.diff_and_packet(
                                     &air,
                                     &slider,
                                     test_button,
                                     service_button,
                                 ) {
-                                    if let Some(packet) = state_tracker.diff_and_packet(
-                                        &air,
-                                        &slider,
-                                        test_button,
-                                        service_button,
-                                    ) {
-                                        let _ = inbound_tx.send(IoInboundMessage::Input {
-                                            client_id: "brokenithm".to_string(),
-                                            packet,
-                                        });
-                                    }
+                                    let _ = inbound_tx.send(IoInboundMessage::Input {
+                                        client_id: "brokenithm".to_string(),
+                                        packet,
+                                    });
                                 }
                                 // Always update shared state after coin pulse
                                 state_tracker.update_shared_state(test_button, service_button);
@@ -737,16 +879,129 @@ fn reorder_air_zones(air: &[u8]) -> Vec<u8> {
 }
 
 fn led_test_pattern() -> Vec<u8> {
-    let mut led_msg = Vec::with_capacity(4 + 32 * 3);
-    // Header: 99, 'L', 'E', 'D' (cLED pattern expected by Swift client)
-    led_msg.extend_from_slice(&[99, 76, 69, 68]); // "cLED"
-    // 32 zones, RGB triplets
-    for i in 0..32 {
-        if i % 2 == 0 {
-            led_msg.extend_from_slice(&rgb_to_brg(&[255, 0, 0])); // Red
+    let mut slots = [[0u8, 0u8, 0u8]; 32];
+    for (i, slot) in slots.iter_mut().enumerate() {
+        *slot = if i % 2 == 0 {
+            [255, 0, 0] // Red
         } else {
-            led_msg.extend_from_slice(&rgb_to_brg(&[0, 0, 255])); // Blue
+            [0, 0, 255] // Blue
+        };
+    }
+    cled_frame(&slots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feedback::LedPattern;
+
+    /// Mirror of the iOS client: copy the payload, reverse it, then read lane `i`
+    /// as main `[g, r, b]` at 6i and split `[g, r, b]` at 6i+3.
+    fn client_lane(frame: &[u8], lane: usize) -> ((u8, u8, u8), (u8, u8, u8)) {
+        assert_eq!(&frame[..4], &[99, 76, 69, 68]);
+        let payload = &frame[4..];
+        assert_eq!(payload.len(), 96);
+        let reversed: Vec<u8> = payload.iter().rev().copied().collect();
+        let at = |offset: usize| (reversed[offset + 1], reversed[offset], reversed[offset + 2]);
+        (at(lane * 6), at(lane * 6 + 3))
+    }
+
+    #[test]
+    fn cled_frame_matches_client_layout() {
+        let mut slots = [[0u8; 3]; 32];
+        slots[0] = [10, 20, 30];
+        slots[1] = [40, 50, 60];
+        slots[31] = [70, 80, 90];
+        let frame = cled_frame(&slots);
+        assert_eq!(frame.len(), 100);
+        assert_eq!(client_lane(&frame, 0), ((10, 20, 30), (40, 50, 60)));
+        assert_eq!(client_lane(&frame, 15).1, (70, 80, 90));
+    }
+
+    #[test]
+    fn slider_pattern_lights_touched_lanes() {
+        let mut slider = vec![0u8; 32];
+        slider[0] = 128; // lane 0 main
+        slider[5] = 128; // lane 2 split
+        let frame = led_slider_active_pattern(&slider);
+        assert_eq!(client_lane(&frame, 0), ((255, 255, 255), (0, 0, 0)));
+        assert_eq!(client_lane(&frame, 2), ((0, 0, 0), (255, 255, 255)));
+        assert_eq!(client_lane(&frame, 1), ((0, 0, 0), (0, 0, 0)));
+    }
+
+    #[test]
+    fn feedback_zones_fill_both_slots() {
+        let events = (0..16)
+            .map(|i| {
+                FeedbackEvent::Led(LedEvent::Set {
+                    led_id: i as u8,
+                    on: true,
+                    brightness: Some(255),
+                    rgb: Some((i as u8, 0, 0)),
+                })
+            })
+            .collect();
+        let packet = FeedbackEventPacket {
+            device_id: LED_SLIDER_DEVICE_ID.to_string(),
+            timestamp: 0,
+            events,
+        };
+        let frame = led_feedback_to_cled(&packet);
+        for lane in 0..16 {
+            let expected = (lane as u8, 0, 0);
+            assert_eq!(client_lane(&frame, lane), (expected, expected));
         }
     }
-    led_msg
+
+    #[test]
+    fn feedback_raw_leds_keep_slots() {
+        let events = (0..31)
+            .map(|i| {
+                FeedbackEvent::Led(LedEvent::Set {
+                    led_id: i as u8,
+                    on: true,
+                    brightness: Some(255),
+                    rgb: Some((0, i as u8, 0)),
+                })
+            })
+            .collect();
+        let packet = FeedbackEventPacket {
+            device_id: LED_SLIDER_DEVICE_ID.to_string(),
+            timestamp: 0,
+            events,
+        };
+        let frame = led_feedback_to_cled(&packet);
+        assert_eq!(client_lane(&frame, 0), ((0, 0, 0), (0, 1, 0)));
+        assert_eq!(client_lane(&frame, 1), ((0, 2, 0), (0, 3, 0)));
+    }
+
+    #[test]
+    fn non_rgb_events_do_not_panic() {
+        let packet = FeedbackEventPacket {
+            device_id: LED_SLIDER_DEVICE_ID.to_string(),
+            timestamp: 0,
+            events: vec![
+                FeedbackEvent::Led(LedEvent::SetPattern {
+                    led_id: 0,
+                    pattern: LedPattern::Solid,
+                }),
+                FeedbackEvent::Led(LedEvent::Set {
+                    led_id: 40,
+                    on: true,
+                    brightness: Some(255),
+                    rgb: Some((1, 2, 3)),
+                }),
+            ],
+        };
+        let frame = led_feedback_to_cled(&packet);
+        assert_eq!(frame.len(), 100);
+        assert_eq!(client_lane(&frame, 0), ((0, 0, 0), (0, 0, 0)));
+    }
+
+    #[test]
+    fn test_pattern_is_still_valid() {
+        let frame = led_test_pattern();
+        assert_eq!(frame.len(), 100);
+        assert_eq!(client_lane(&frame, 0).0, (255, 0, 0));
+    }
 }

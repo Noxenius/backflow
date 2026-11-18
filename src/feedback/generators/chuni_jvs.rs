@@ -331,31 +331,29 @@ impl ChuniJvsReader {
         }
 
         let listener = UnixListener::bind(&self.socket_path)?;
-        let mut parser = ChuniLedParser::new();
         let mut buf = vec![0; 4096];
 
         loop {
             match listener.accept().await {
                 Ok((mut stream, _addr)) => {
                     info!("Accepted new JVS client connection");
+                    // Frames are read from a byte stream, so a 95-byte slider frame can
+                    // arrive split across two reads; keep the tail until it completes.
+                    let mut pending: Vec<u8> = Vec::new();
                     loop {
                         match stream.read(&mut buf).await {
                             Ok(0) => {
                                 info!("JVS client disconnected");
                                 break;
                             }
-                            Ok(n) => match parser.parse_packets(&buf[..n]) {
-                                Ok(packets) => {
-                                    for packet in packets {
-                                        if let Err(e) = self.packet_sender.send(packet) {
-                                            warn!("Failed to send LED packet: {}", e);
-                                        }
+                            Ok(n) => {
+                                pending.extend_from_slice(&buf[..n]);
+                                for packet in drain_led_packets(&mut pending) {
+                                    if let Err(e) = self.packet_sender.send(packet) {
+                                        warn!("Failed to send LED packet: {}", e);
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("Failed to parse JVS packets: {}", e);
-                                }
-                            },
+                            }
                             Err(e) => {
                                 warn!("Failed to read from JVS client: {}", e);
                                 break;
@@ -369,6 +367,39 @@ impl ChuniJvsReader {
             }
         }
     }
+}
+
+/// Pull every complete LED frame out of `pending`, leaving an incomplete tail in place.
+pub fn drain_led_packets(pending: &mut Vec<u8>) -> Vec<ChuniLedDataPacket> {
+    let mut packets = Vec::new();
+    let mut consumed = 0usize;
+
+    while consumed < pending.len() {
+        let window = &pending[consumed..];
+        let Some(frame_pos) = window.iter().position(|&b| b == LED_PACKET_FRAMING) else {
+            // No sync byte left: drop the garbage.
+            consumed = pending.len();
+            break;
+        };
+        if frame_pos > 0 {
+            consumed += frame_pos;
+            continue;
+        }
+
+        match ChuniLedDataPacket::try_parse_packet(window) {
+            Ok((packet, used)) => {
+                packets.push(packet);
+                consumed += used;
+            }
+            Err(DecodeError::Incomplete) => break,
+            Err(_) => consumed += 1, // Skip the bad byte and resync
+        }
+    }
+
+    if consumed > 0 {
+        pending.drain(..consumed);
+    }
+    packets
 }
 
 /// Board type enumeration for better type safety
@@ -610,6 +641,26 @@ impl ChuniRgbService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_frame_is_reassembled() {
+        let mut frame = vec![LED_PACKET_FRAMING, 2];
+        for i in 0..31 {
+            frame.extend_from_slice(&[i as u8, 0, 0]);
+        }
+
+        // First read stops in the middle of the payload.
+        let mut pending = frame[..40].to_vec();
+        assert!(drain_led_packets(&mut pending).is_empty());
+        assert_eq!(pending.len(), 40);
+
+        // Second read completes it.
+        pending.extend_from_slice(&frame[40..]);
+        let packets = drain_led_packets(&mut pending);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].board, 2);
+        assert!(pending.is_empty());
+    }
 
     #[test]
     fn test_packet_parsing() {

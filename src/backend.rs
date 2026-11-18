@@ -477,7 +477,8 @@ impl Backend {
                 Ok(connect_addr) => {
                     use crate::input::brokenithm::BrokenithmTcpBackend;
                     let inbound_tx = io_server.inbound_sender();
-                    let mut backend = BrokenithmTcpBackend::client(connect_addr, inbound_tx);
+                    let mut backend = BrokenithmTcpBackend::client(connect_addr, inbound_tx)
+                        .with_io_server(io_server.clone());
                     if let Err(e) = backend.run().await {
                         tracing::error!("Brokenithm TCP client backend error: {}", e);
                     }
@@ -508,7 +509,8 @@ impl Backend {
             use crate::input::brokenithm::BrokenithmTcpBackend;
             let inbound_tx = io_server.inbound_sender();
             let mut backend =
-                BrokenithmTcpBackend::device_proxy(local_port, device_port, udid, inbound_tx);
+                BrokenithmTcpBackend::device_proxy(local_port, device_port, udid, inbound_tx)
+                    .with_io_server(io_server.clone());
             if let Err(e) = backend.run().await {
                 tracing::error!("Brokenithm iDevice client backend error: {}", e);
             }
