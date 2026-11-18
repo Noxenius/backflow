@@ -694,9 +694,10 @@ impl Backend {
             crate::feedback::generators::chuni_jvs::create_chuni_led_channel();
 
         // Start JVS reader
+        let reader_tx = jvs_led_tx.clone();
         self.spawn_service("chuniio_jvs_reader", async move {
             use crate::feedback::generators::chuni_jvs::ChuniJvsReader;
-            let mut reader = ChuniJvsReader::new(socket_path, jvs_led_tx);
+            let mut reader = ChuniJvsReader::new(socket_path, reader_tx);
             if let Err(e) = reader.run().await {
                 tracing::error!("ChuniIO JVS reader error: {}", e);
             }
@@ -710,8 +711,18 @@ impl Backend {
             }
         });
 
-        // Discard LED packets from chuniio_proxy since we're using JVS reader
-        self.start_led_packet_drain_service(led_packet_rx);
+        // Also forward the LED packets the game already sends over the chuniio
+        // proxy protocol into the same channel. They used to be discarded when a
+        // socket_path was configured, which meant no slider LEDs at all unless
+        // Outflow was running inside the Wine prefix.
+        self.spawn_service("chuniio_led_merge", async move {
+            let mut led_packet_rx = led_packet_rx;
+            while let Some(packet) = led_packet_rx.recv().await {
+                if jvs_led_tx.send(packet).is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// Start ChuniIO proxy-fed feedback service

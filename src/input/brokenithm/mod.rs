@@ -242,12 +242,17 @@ fn led_feedback_to_cled(feedback: &FeedbackEventPacket) -> Vec<u8> {
     cled_frame(&slots)
 }
 
-/// LED pattern: set only active slider zones to white, others off
+/// LED pattern: set only active slider zones to white, others off.
+///
+/// The client mirrors its 32 zones before sending (`lanes.reversed()`), so the
+/// wire array is in reverse display order: zone `2i` of lane `i` arrives at
+/// index `31 - 2i` and its split slot at `30 - 2i`. Reading `2i` directly lit
+/// the opposite end of the board.
 fn led_slider_active_pattern(slider: &[u8]) -> Vec<u8> {
     let mut slots = [[0u8, 0u8, 0u8]; 32];
     for lane in 0..16 {
-        let main = slider.get(lane * 2).copied().unwrap_or(0) >= 128;
-        let split = slider.get(lane * 2 + 1).copied().unwrap_or(0) >= 128;
+        let main = slider.get(31 - lane * 2).copied().unwrap_or(0) >= 128;
+        let split = slider.get(30 - lane * 2).copied().unwrap_or(0) >= 128;
         if main {
             slots[lane * 2] = [255, 255, 255];
         }
@@ -920,13 +925,27 @@ mod tests {
 
     #[test]
     fn slider_pattern_lights_touched_lanes() {
+        // The client mirrors its zones before sending, so a touch on lane 0
+        // arrives at index 31 and a touch on lane 15 at index 1.
         let mut slider = vec![0u8; 32];
-        slider[0] = 128; // lane 0 main
-        slider[5] = 128; // lane 2 split
+        slider[31] = 128; // lane 0 main
+        slider[30] = 128; // lane 0 split
+        slider[4] = 128; // lane 13 split
+        let frame = led_slider_active_pattern(&slider);
+        assert_eq!(client_lane(&frame, 0), ((255, 255, 255), (255, 255, 255)));
+        assert_eq!(client_lane(&frame, 13), ((0, 0, 0), (255, 255, 255)));
+        assert_eq!(client_lane(&frame, 1), ((0, 0, 0), (0, 0, 0)));
+    }
+
+    #[test]
+    fn slider_pattern_is_not_mirrored() {
+        // Regression: reading slider[2i] lit the opposite end of the board, so a
+        // touch on the far left tile lit the far right one.
+        let mut slider = vec![0u8; 32];
+        slider[31] = 128; // far left lane, main slot
         let frame = led_slider_active_pattern(&slider);
         assert_eq!(client_lane(&frame, 0), ((255, 255, 255), (0, 0, 0)));
-        assert_eq!(client_lane(&frame, 2), ((0, 0, 0), (255, 255, 255)));
-        assert_eq!(client_lane(&frame, 1), ((0, 0, 0), (0, 0, 0)));
+        assert_eq!(client_lane(&frame, 15), ((0, 0, 0), (0, 0, 0)));
     }
 
     #[test]
