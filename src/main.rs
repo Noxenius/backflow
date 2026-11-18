@@ -30,18 +30,25 @@ pub fn build_logger() -> Result<()> {
         // .add_directive("Backflow=trace".parse().unwrap())
     });
 
+    // Tracy profiling is opt-in: the client's worker thread aborts the process
+    // (`broadcastMsg.activeTime >= 0` assertion) after a few minutes of uptime,
+    // which is not acceptable for a long-running input backend.
+    let tracy_layer = if std::env::var_os("BACKFLOW_TRACY").is_some() {
+        Some(tracing_tracy::TracyLayer::default())
+    } else {
+        None
+    };
+
     // Set up Tracy profiling layer in addition to normal logging
     tracing::subscriber::set_global_default(
-        tracing_subscriber::registry()
-            .with(tracing_tracy::TracyLayer::default())
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_thread_ids(true)
-                    .with_thread_names(true)
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_filter(env_filter),
-            ),
+        tracing_subscriber::registry().with(tracy_layer).with(
+            tracing_subscriber::fmt::layer()
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_filter(env_filter),
+        ),
     )
     .map_err(|e| eyre::eyre!("Failed to initialize logger: {}", e))?;
 
