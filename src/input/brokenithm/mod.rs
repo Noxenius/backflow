@@ -38,6 +38,63 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Exponential reconnect delay with a short ceiling.
+///
+/// A disconnected iPad used to be retried every 500 ms forever, which turned a
+/// single closed socket into thousands of log lines per minute. Backing off to a
+/// few seconds keeps the log readable while still reconnecting quickly once the
+/// app is back.
+struct ReconnectBackoff {
+    current: std::time::Duration,
+}
+
+impl ReconnectBackoff {
+    const INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(5);
+    /// A connection that lived at least this long counts as healthy, so the next
+    /// attempt starts from the short delay again.
+    const STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn next_delay(&mut self) -> std::time::Duration {
+        let delay = self.current;
+        self.current = (self.current * 2).min(Self::MAX);
+        delay
+    }
+
+    fn reset(&mut self) {
+        self.current = Self::INITIAL;
+    }
+
+    /// Called after a connection ends. A connection that stayed up long enough
+    /// resets the delay; a flapping one keeps backing off so a half-open socket
+    /// cannot spin the reconnect loop. Returns the delay before the next attempt.
+    fn after_disconnect(&mut self, lived: std::time::Duration) -> std::time::Duration {
+        if lived >= Self::STABLE_AFTER {
+            self.reset();
+        }
+        self.next_delay()
+    }
+}
+
+/// Log a dropped connection once, with how long it lasted and when the next
+/// attempt happens. Reconnect churn used to log a line per attempt at info level.
+fn log_disconnect(addr: SocketAddr, lived: std::time::Duration, delay: std::time::Duration) {
+    tracing::info!(
+        "Brokenithm connection to {} closed after {:.1}s; retrying in {:?}",
+        addr,
+        lived.as_secs_f64(),
+        delay
+    );
+}
+
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
+        Self {
+            current: Self::INITIAL,
+        }
+    }
+}
+
 mod idevice_proxy;
 use idevice_proxy::spawn_iproxy;
 
@@ -391,14 +448,16 @@ impl BrokenithmTcpBackend {
         let last_feedback_ms = Arc::new(AtomicU64::new(0));
         self.spawn_led_broadcast(clients.clone(), last_feedback_ms.clone());
 
+        let mut backoff = ReconnectBackoff::default();
         loop {
             match TcpStream::connect(connect_addr).await {
                 Ok(socket) => {
-                    tracing::info!("Connected to Brokenithm device at {}", connect_addr);
+                    tracing::debug!("Connected to Brokenithm device at {}", connect_addr);
                     let (read_half, write_half) = socket.into_split();
                     let writer: ClientWriter = Arc::new(tokio::sync::Mutex::new(write_half));
                     clients.write().await.push(writer.clone());
                     let inbound_tx = self.inbound_tx.clone();
+                    let connected_at = std::time::Instant::now();
                     Self::handle_connection(
                         read_half,
                         writer,
@@ -408,14 +467,20 @@ impl BrokenithmTcpBackend {
                         last_feedback_ms.clone(),
                     )
                     .await;
+                    let lived = connected_at.elapsed();
+                    let delay = backoff.after_disconnect(lived);
+                    log_disconnect(connect_addr, lived, delay);
+                    tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to connect to {}: {}. Retrying in 1s...",
+                    let delay = backoff.next_delay();
+                    tracing::debug!(
+                        "Failed to connect to {}: {}. Retrying in {:?}...",
                         connect_addr,
-                        e
+                        e,
+                        delay
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -441,6 +506,7 @@ impl BrokenithmTcpBackend {
 
         // Connect to the local forwarded port
         let connect_addr = format!("127.0.0.1:{local_port}");
+        let mut backoff = ReconnectBackoff::default();
         loop {
             match TcpStream::connect(&connect_addr).await {
                 Ok(socket) => {
@@ -452,6 +518,7 @@ impl BrokenithmTcpBackend {
                     let writer: ClientWriter = Arc::new(tokio::sync::Mutex::new(write_half));
                     clients.write().await.push(writer.clone());
                     let inbound_tx = self.inbound_tx.clone();
+                    let connected_at = std::time::Instant::now();
                     Self::handle_connection(
                         read_half,
                         writer,
@@ -461,14 +528,24 @@ impl BrokenithmTcpBackend {
                         last_feedback_ms.clone(),
                     )
                     .await;
+                    let lived = connected_at.elapsed();
+                    let delay = backoff.after_disconnect(lived);
+                    log_disconnect(
+                        connect_addr.parse().expect("connect_addr is a socket addr"),
+                        lived,
+                        delay,
+                    );
+                    tokio::time::sleep(delay).await;
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to connect to {}: {}. Retrying in 500ms...",
+                    let delay = backoff.next_delay();
+                    tracing::debug!(
+                        "Failed to connect to {}: {}. Retrying in {:?}...",
                         connect_addr,
-                        e
+                        e,
+                        delay
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -1022,5 +1099,19 @@ mod tests {
         let frame = led_test_pattern();
         assert_eq!(frame.len(), 100);
         assert_eq!(client_lane(&frame, 0).0, (255, 0, 0));
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_then_resets() {
+        let mut backoff = ReconnectBackoff::default();
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_millis(500));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(4));
+        assert_eq!(backoff.next_delay(), ReconnectBackoff::MAX);
+        assert_eq!(backoff.next_delay(), ReconnectBackoff::MAX);
+
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_millis(500));
     }
 }

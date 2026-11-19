@@ -456,14 +456,17 @@ impl Backend {
         port: u16,
         idevice_params: Option<(u16, u16, Option<String>)>,
     ) {
-        // Main TCP client
-        self.start_brokenithm_tcp_service_with_params(host, port);
-
-        // iDevice proxy if configured
+        // The iDevice proxy already forwards the device port to a local port, so
+        // the plain TCP client would dial the same `iproxy` listener a second
+        // time. Both then reconnect in lockstep whenever the app is not
+        // listening, which floods the log and doubles the churn.
         if let Some((local_port, device_port, udid)) = idevice_params {
+            tracing::info!(
+                "Brokenithm TCP client backend skipped: iDevice proxy already forwards port {device_port} to localhost:{local_port}"
+            );
             self.start_brokenithm_idevice_service_with_params(local_port, device_port, udid);
         } else {
-            tracing::info!("Brokenithm iDevice client backend is disabled or not configured");
+            self.start_brokenithm_tcp_service_with_params(host, port);
         }
     }
 
